@@ -19,6 +19,37 @@ def _get_cloudinary():
     return cloudinary.uploader
 
 
+async def upload_raw_bytes(data: bytes, public_id: Optional[str] = None) -> Optional[str]:
+    """
+    Upload raw image bytes to Cloudinary.
+    Returns the secure HTTPS URL of the uploaded image, or None on failure.
+    """
+    from app.config import settings
+    import io
+
+    if not all([settings.cloudinary_cloud_name, settings.cloudinary_api_key, settings.cloudinary_api_secret]):
+        logger.warning("Cloudinary credentials not configured, cannot upload raw bytes")
+        return None
+
+    try:
+        uploader = _get_cloudinary()
+        upload_options = {
+            "folder": "social_manager_ai",
+            "overwrite": True,
+        }
+        if public_id:
+            upload_options["public_id"] = public_id
+
+        result = uploader.upload(io.BytesIO(data), **upload_options)
+        secure_url = result.get("secure_url")
+        logger.info(f"Uploaded raw bytes to Cloudinary: {secure_url}")
+        return secure_url
+
+    except Exception as e:
+        logger.error(f"Cloudinary raw bytes upload error: {e}")
+        return None
+
+
 async def upload_from_url(image_url: str, public_id: Optional[str] = None) -> Optional[str]:
     """
     Upload an image from a URL to Cloudinary.

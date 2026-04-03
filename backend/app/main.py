@@ -50,15 +50,28 @@ async def startup_event():
     logger.info("Starting APScheduler...")
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
         from app.services.post_dispatcher import dispatch_scheduled_posts
 
+        def _job_error_listener(event):
+            if event.exception:
+                logger.error(
+                    f"APScheduler job '{event.job_id}' raised an exception: {event.exception}",
+                    exc_info=event.traceback,
+                )
+            else:
+                logger.warning(f"APScheduler job '{event.job_id}' was missed (misfire)")
+
         scheduler = AsyncIOScheduler()
+        scheduler.add_listener(_job_error_listener, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
         scheduler.add_job(
             dispatch_scheduled_posts,
             trigger="interval",
             minutes=1,
             id="dispatch_posts",
             replace_existing=True,
+            misfire_grace_time=30,
+            coalesce=True,
         )
         scheduler.start()
         app.state.scheduler = scheduler

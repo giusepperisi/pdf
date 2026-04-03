@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Optional
 from datetime import datetime, timezone
@@ -6,7 +7,32 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-GRAPH_API_BASE = "https://graph.facebook.com/v19.0"
+GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
+
+# Backoff delays in seconds: 60s, 300s, 900s
+_RETRY_DELAYS = [60, 300, 900]
+
+
+async def _post_with_retry(client: httpx.AsyncClient, url: str, payload: dict) -> Optional[dict]:
+    """
+    POST with exponential backoff retry on rate-limit (429) or transient errors (5xx).
+    Returns parsed JSON dict on success, or None after all retries exhausted.
+    """
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+        if delay:
+            logger.warning(f"Rate limit hit, retrying in {delay}s (attempt {attempt + 1}/4)")
+            await asyncio.sleep(delay)
+        try:
+            resp = await client.post(url, data=payload)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                logger.warning(f"HTTP {resp.status_code} on attempt {attempt + 1}, will retry")
+                continue
+            return resp.json()
+        except httpx.TransportError as e:
+            logger.warning(f"Transport error on attempt {attempt + 1}: {e}")
+            if attempt == len(_RETRY_DELAYS):
+                raise
+    return None
 
 
 async def post_to_facebook(
@@ -19,28 +45,24 @@ async def post_to_facebook(
     Post content to a Facebook Page.
     If image_url is provided, posts a photo with caption.
     Otherwise posts a text-only message.
+    Retries on rate-limit with backoff 1min→5min→15min.
     Returns the Facebook post ID on success, or None on failure.
     """
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             if image_url:
                 url = f"{GRAPH_API_BASE}/{page_id}/photos"
-                payload = {
-                    "url": image_url,
-                    "caption": text,
-                    "access_token": token,
-                }
+                payload = {"url": image_url, "caption": text, "access_token": token}
             else:
                 url = f"{GRAPH_API_BASE}/{page_id}/feed"
-                payload = {
-                    "message": text,
-                    "access_token": token,
-                }
+                payload = {"message": text, "access_token": token}
 
-            resp = await client.post(url, data=payload)
-            data = resp.json()
+            data = await _post_with_retry(client, url, payload)
+            if data is None:
+                logger.error("Facebook API: all retries exhausted")
+                return None
 
-            if resp.status_code == 200 and ("id" in data or "post_id" in data):
+            if "id" in data or "post_id" in data:
                 post_id = data.get("post_id") or data.get("id")
                 logger.info(f"Posted to Facebook page {page_id}: {post_id}")
                 return post_id
@@ -64,22 +86,18 @@ async def post_to_instagram(
     Post a photo to an Instagram Business account using 2-step process:
     1. Create media container
     2. Publish the container
+    Retries on rate-limit with backoff 1min→5min→15min.
     Returns the Instagram media ID on success, or None on failure.
     """
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Step 1: Create media container
             container_url = f"{GRAPH_API_BASE}/{ig_user_id}/media"
-            container_payload = {
-                "image_url": image_url,
-                "caption": caption,
-                "access_token": token,
-            }
-            resp1 = await client.post(container_url, data=container_payload)
-            data1 = resp1.json()
+            container_payload = {"image_url": image_url, "caption": caption, "access_token": token}
+            data1 = await _post_with_retry(client, container_url, container_payload)
 
-            if resp1.status_code != 200 or "id" not in data1:
-                error = data1.get("error", {})
+            if data1 is None or "id" not in data1:
+                error = (data1 or {}).get("error", {})
                 logger.error(f"Instagram container creation error: {error.get('message', str(data1))}")
                 return None
 
@@ -88,19 +106,15 @@ async def post_to_instagram(
 
             # Step 2: Publish the container
             publish_url = f"{GRAPH_API_BASE}/{ig_user_id}/media_publish"
-            publish_payload = {
-                "creation_id": container_id,
-                "access_token": token,
-            }
-            resp2 = await client.post(publish_url, data=publish_payload)
-            data2 = resp2.json()
+            publish_payload = {"creation_id": container_id, "access_token": token}
+            data2 = await _post_with_retry(client, publish_url, publish_payload)
 
-            if resp2.status_code == 200 and "id" in data2:
+            if data2 and "id" in data2:
                 media_id = data2["id"]
                 logger.info(f"Posted to Instagram account {ig_user_id}: {media_id}")
                 return media_id
             else:
-                error = data2.get("error", {})
+                error = (data2 or {}).get("error", {})
                 logger.error(f"Instagram publish error: {error.get('message', str(data2))}")
                 return None
 

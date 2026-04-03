@@ -47,6 +47,7 @@ async def _huggingface_image(prompt: str) -> Optional[str]:
     """
     Use HuggingFace Inference API as fallback.
     Requires HUGGINGFACE_TOKEN env var. Uses stabilityai/stable-diffusion-2-1 (free tier).
+    Uploads returned bytes to Cloudinary and returns the public URL.
     """
     from app.config import settings
 
@@ -62,9 +63,15 @@ async def _huggingface_image(prompt: str) -> Optional[str]:
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(api_url, headers=headers, json=payload)
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
-                # HuggingFace returns raw bytes — we can't return a URL directly
-                # We'll return None here and let the caller handle raw bytes if needed
-                logger.info("HuggingFace returned image bytes (URL not available without upload)")
+                logger.info("HuggingFace returned image bytes, uploading to Cloudinary")
+                from app.services.cloudinary_service import upload_raw_bytes
+                import hashlib
+                public_id = f"hf_{hashlib.md5(prompt.encode()).hexdigest()[:12]}"
+                url = await upload_raw_bytes(resp.content, public_id=public_id)
+                if url:
+                    logger.info(f"HuggingFace image uploaded to Cloudinary: {url}")
+                    return url
+                logger.warning("Cloudinary upload of HuggingFace bytes failed")
                 return None
             logger.warning(f"HuggingFace returned status {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
